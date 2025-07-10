@@ -158,6 +158,7 @@ zed_actions.workspace = true
 zeta.workspace = true
 zlog.workspace = true
 zlog_settings.workspace = true
+google_vertex_ai = { version = "0.1.0", path = "../google_vertex_ai" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows.workspace = true
