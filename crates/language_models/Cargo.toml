@@ -31,6 +31,7 @@ editor.workspace = true
 feature_flags.workspace = true
 fs.workspace = true
 futures.workspace = true
+gcp_auth.workspace = true
 google_ai = { workspace = true, features = ["schemars"] }
 google_vertex_ai = { workspace = true, features = ["schemars"] }
 gpui.workspace = true

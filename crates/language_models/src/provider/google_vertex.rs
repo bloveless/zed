@@ -1,6 +1,7 @@
 use anyhow::{Context as _, Result, anyhow};
 use collections::BTreeMap;
 use credentials_provider::CredentialsProvider;
+use futures::TryFutureExt;
 use futures::{FutureExt, Stream, StreamExt, future::BoxFuture};
 use google_vertex_ai::{
     FunctionDeclaration, GenerateContentResponse, GoogleModelMode, Part, SystemInstruction,
@@ -88,6 +89,7 @@ pub struct GoogleVertexLanguageModelProvider {
 
 pub struct State {
     api_key: Option<String>,
+    api_key_expiration: Option<chrono::DateTime<chrono::Utc>>,
     api_key_from_env: bool,
     _subscription: Subscription,
 }
@@ -95,6 +97,8 @@ pub struct State {
 impl State {
     fn is_authenticated(&self) -> bool {
         self.api_key.is_some()
+            && self.api_key_expiration.is_some()
+            && self.api_key_expiration.unwrap() > chrono::Utc::now()
     }
 
     fn reset_api_key(&self, cx: &mut Context<Self>) -> Task<Result<()>> {
@@ -111,6 +115,7 @@ impl State {
                 .log_err();
             this.update(cx, |this, cx| {
                 this.api_key = None;
+                this.api_key_expiration = None;
                 this.api_key_from_env = false;
                 cx.notify();
             })
@@ -124,55 +129,26 @@ impl State {
             return Task::ready(Ok(()));
         }
 
-        // The Tokio runtime provided by `gpui::spawn` is not sufficient for `tokio::process`
-        // or `tokio::task::spawn_blocking`. We must fall back to the standard library's threading
-        // to run the synchronous `gcloud` command, and use a channel to communicate the
-        // result back to our async context.
         cx.spawn(async move |this, cx| {
-            let (tx, rx) = futures::channel::oneshot::channel();
+            let provider = gcp_auth::provider().await.map_err(|e| {
+                AuthenticateError::Other(anyhow!("Failed to load gcp auth provider: {}", e))
+            })?;
+            let scopes = &["https://www.googleapis.com/auth/cloud-platform"];
+            let token = provider.token(scopes).await.map_err(|e| {
+                AuthenticateError::Other(anyhow!(
+                    "Failed to get token from gcp auth provider: {}",
+                    e
+                ))
+            })?;
 
-            std::thread::spawn(move || {
-                let result = std::process::Command::new("gcloud")
-                    .args(&["auth", "application-default", "print-access-token"])
-                    .output()
-                    .map_err(|e| {
-                        AuthenticateError::Other(anyhow!("Failed to execute gcloud command: {}", e))
-                    });
-
-                // Send the result back to the async task, ignoring if the receiver was dropped.
-                let _ = tx.send(result);
-            });
-
-            // Await the result from the channel.
-            // First, explicitly handle the channel's `Canceled` error.
-            // Then, use `?` to propagate the `AuthenticateError` from the command execution.
-            let token_output = rx.await.map_err(|_cancelled| {
-                AuthenticateError::Other(anyhow!("Authentication task was cancelled"))
-            })??;
-
-            // Retrieve the access token from the gcloud command output.
-            // Ensure UTF-8 decoding and trim whitespace.
-            let access_token = String::from_utf8(token_output.stdout)
-                .map_err(|e| {
-                    AuthenticateError::Other(anyhow!("Invalid UTF-8 in gcloud output: {}", e))
-                })?
-                .trim()
-                .to_string();
-
-            // Check the exit status of the gcloud command.
-            if !token_output.status.success() {
-                let stderr = String::from_utf8_lossy(&token_output.stderr).into_owned();
-                return Err(AuthenticateError::Other(anyhow!(
-                    "gcloud command failed: {}",
-                    stderr
-                )));
-            }
-
-            let api_key = access_token; // Use the retrieved token as the API key.
+            let api_key = token.as_str().to_owned(); // Use the retrieved token as the API key.
             let from_env = false; // This token is dynamically fetched, not from env or keychain.
+
+            print!("google vertex token expires at {}", token.expires_at());
 
             this.update(cx, |this, cx| {
                 this.api_key = Some(api_key);
+                this.api_key_expiration = Some(token.expires_at());
                 this.api_key_from_env = from_env;
                 cx.notify();
             })?;
@@ -186,6 +162,7 @@ impl GoogleVertexLanguageModelProvider {
     pub fn new(http_client: Arc<dyn HttpClient>, cx: &mut App) -> Self {
         let state = cx.new(|cx| State {
             api_key: None,
+            api_key_expiration: None,
             api_key_from_env: false,
             _subscription: cx.observe_global::<SettingsStore>(|_, cx| {
                 cx.notify();
@@ -887,6 +864,7 @@ impl Render for ConfigurationView {
                 .child(Label::new("Attempting to authenticate with gcloud..."))
                 .into_any()
         } else if !is_authenticated {
+            // TODO: what should be done here if the users token has expired. If a new one can be retrieved then it isn't actually unauthenticated
             v_flex()
                 .size_full()
                 .child(Label::new("Please authenticate with Google Cloud to use this provider."))
