@@ -1,13 +1,17 @@
 use anyhow::{Context as _, Result, anyhow};
 use collections::BTreeMap;
 use credentials_provider::CredentialsProvider;
-use futures::TryFutureExt;
 use futures::{FutureExt, Stream, StreamExt, future::BoxFuture};
+use google_cloud_auth::{
+    project::{Config, create_token_source_from_project, project},
+    token_source::TokenSource,
+};
 use google_vertex_ai::{
     FunctionDeclaration, GenerateContentResponse, GoogleModelMode, Part, SystemInstruction,
     ThinkingConfig, UsageMetadata,
 };
-use gpui::{AnyView, App, AsyncApp, Context, Subscription, Task};
+use gpui::{AnyView, App, AsyncApp, Context, Subscription, Task, WeakEntity};
+use gpui_tokio::Tokio;
 use http_client::HttpClient;
 use language_model::{
     AuthenticateError, LanguageModelCompletionError, LanguageModelCompletionEvent,
@@ -84,21 +88,20 @@ pub struct AvailableModel {
 
 pub struct GoogleVertexLanguageModelProvider {
     http_client: Arc<dyn HttpClient>,
+    handler: tokio::runtime::Handle,
     state: gpui::Entity<State>,
 }
 
 pub struct State {
+    token_source: Option<Box<dyn TokenSource>>,
     api_key: Option<String>,
-    api_key_expiration: Option<chrono::DateTime<chrono::Utc>>,
     api_key_from_env: bool,
     _subscription: Subscription,
 }
 
 impl State {
     fn is_authenticated(&self) -> bool {
-        self.api_key.is_some()
-            && self.api_key_expiration.is_some()
-            && self.api_key_expiration.unwrap() > chrono::Utc::now()
+        self.token_source.is_some()
     }
 
     fn reset_api_key(&self, cx: &mut Context<Self>) -> Task<Result<()>> {
@@ -114,8 +117,8 @@ impl State {
                 .await
                 .log_err();
             this.update(cx, |this, cx| {
+                this.token_source = None;
                 this.api_key = None;
-                this.api_key_expiration = None;
                 this.api_key_from_env = false;
                 cx.notify();
             })
@@ -129,47 +132,71 @@ impl State {
             return Task::ready(Ok(()));
         }
 
-        cx.spawn(async move |this, cx| {
-            let provider = gcp_auth::provider().await.map_err(|e| {
-                AuthenticateError::Other(anyhow!("Failed to load gcp auth provider: {}", e))
-            })?;
-            let scopes = &["https://www.googleapis.com/auth/cloud-platform"];
-            let token = provider.token(scopes).await.map_err(|e| {
-                AuthenticateError::Other(anyhow!(
-                    "Failed to get token from gcp auth provider: {}",
-                    e
-                ))
-            })?;
-
-            let api_key = token.as_str().to_owned(); // Use the retrieved token as the API key.
-            let from_env = false; // This token is dynamically fetched, not from env or keychain.
-
-            print!("google vertex token expires at {}", token.expires_at());
-
-            this.update(cx, |this, cx| {
-                this.api_key = Some(api_key);
-                this.api_key_expiration = Some(token.expires_at());
-                this.api_key_from_env = from_env;
-                cx.notify();
-            })?;
-
+        cx.spawn(async move |this, cx| -> Result<(), AuthenticateError> {
+            cx.background_spawn(async move |cx| -> Result<(), AuthenticateError> {
+                let config = Config::default()
+                    .with_scopes(&["https://www.googleapis.com/auth/cloud-platform"]);
+                let project = project().await.map_err(|e| {
+                    AuthenticateError::Other(anyhow!("unable to initialize gcp credentials: {}", e))
+                })?;
+                let token_source = create_token_source_from_project(&project, config)
+                    .await
+                    .map_err(|e| {
+                        AuthenticateError::Other(anyhow!(
+                            "unable to create token source from gcp project: {}",
+                            e
+                        ))
+                    })?;
+                token_source.token().await.inspect(|t| {
+                    print!(
+                        "token: {}, expiration: {}",
+                        t.access_token,
+                        t.expiry.unwrap()
+                    )
+                });
+                Ok(())
+            }(cx));
+            // Ok(token_source as Box<dyn TokenSource>)
             Ok(())
         })
+
+        // cx.spawn(|this: WeakEntity<Self>, cx: &mut AsyncApp| async move {
+        //     let background_result = cx.background_spawn(async {}).await;
+
+        //     background_result
+        //         .map_err(|_: anyhow::Error| AuthenticateError::Other(anyhow!("task was cancelled")))
+        //         .map(|token_source| {
+        //             if let Some(this) = this.upgrade() {
+        //                 this.update(cx, |this, cx| {
+        //                     this.token_source = Some(token_source);
+        //                     cx.notify();
+        //                 });
+        //             }
+
+        //             ()
+        //         })
+        // })
     }
 }
 
 impl GoogleVertexLanguageModelProvider {
     pub fn new(http_client: Arc<dyn HttpClient>, cx: &mut App) -> Self {
         let state = cx.new(|cx| State {
+            token_source: None,
             api_key: None,
-            api_key_expiration: None,
             api_key_from_env: false,
             _subscription: cx.observe_global::<SettingsStore>(|_, cx| {
                 cx.notify();
             }),
         });
 
-        Self { http_client, state }
+        let tokio_handle = Tokio::handle(cx);
+
+        Self {
+            http_client,
+            handler: tokio_handle,
+            state,
+        }
     }
 
     fn create_language_model(&self, model: google_vertex_ai::Model) -> Arc<dyn LanguageModel> {

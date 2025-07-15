@@ -468,9 +468,9 @@ fork = "0.2.0"
 futures = "0.3"
 futures-batch = "0.6.1"
 futures-lite = "1.13"
-gcp_auth = "0.12.3"
 git2 = { version = "0.20.1", default-features = false }
 globset = "0.4"
+google-cloud-auth = { package="gcloud-auth", version="1.1.1" }
 handlebars = "4.3"
 heck = "0.5"
 heed = { version = "0.21.0", features = ["read-txn-no-tls"] }
@@ -588,6 +588,7 @@ time = { version = "0.3", features = [
 tiny_http = "0.8"
 tokio = { version = "1" }
 tokio-tungstenite = { version = "0.26", features = ["__rustls-tls"] }
+token-source = "1.0.0"
 toml = "0.8"
 tower-http = "0.4.4"
 tree-sitter = { version = "0.25.6", features = ["wasm"] }
