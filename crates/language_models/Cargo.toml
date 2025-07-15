@@ -31,8 +31,8 @@ editor.workspace = true
 feature_flags.workspace = true
 fs.workspace = true
 futures.workspace = true
-gcp_auth.workspace = true
 google_ai = { workspace = true, features = ["schemars"] }
+google-cloud-auth.workspace = true
 google_vertex_ai = { workspace = true, features = ["schemars"] }
 gpui.workspace = true
 gpui_tokio.workspace = true
@@ -58,7 +58,9 @@ strum.workspace = true
 theme.workspace = true
 thiserror.workspace = true
 tiktoken-rs.workspace = true
+time.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+token-source.workspace = true
 ui.workspace = true
 ui_input.workspace = true
 util.workspace = true
